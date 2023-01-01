@@ -2,6 +2,7 @@
 
 load(":js_binary.bzl", "js_binary_lib")
 load(":js_binary_helpers.bzl", _gather_files_from_js_providers = "gather_files_from_js_providers")
+load("@aspect_bazel_lib//lib:glob_match.bzl", _glob_match = "glob_match")
 load("@bazel_skylib//lib:dicts.bzl", "dicts")
 
 _attrs = dicts.add(js_binary_lib.attrs, {
@@ -19,6 +20,7 @@ _attrs = dicts.add(js_binary_lib.attrs, {
     "grant_sandbox_write_permissions": attr.bool(),
     "allow_execroot_entry_point_with_no_copy_data_to_bin": attr.bool(),
     "command": attr.string(),
+    "packages_to_restart_on_change": attr.string_list(),
 })
 
 def _impl(ctx):
@@ -51,13 +53,20 @@ def _impl(ctx):
     # files as they only include direct npm links (node_modules/foo) and the virtual store tree
     # artifacts those symlinks point to (node_modules/.aspect_rules_js/foo@1.2.3/node_modules/foo)
     data_files = []
+    files_to_restart_on_change = []
     for f in depset(transitive = transitive_runfiles + [dep.files for dep in ctx.attr.data]).to_list():
         # don't include the virtual store tree artifact; only the node_module link is needed
         if not "/.aspect_rules_js/" in f.path:
             data_files.append(f)
 
+        for pattern in ctx.attr.packages_to_restart_on_change:
+            if _glob_match("**/.aspect_rules_js/**/node_modules/" + pattern, f.path):
+                files_to_restart_on_change.append(f)
+                break
+
     config = {
         "data_files": [f.short_path for f in data_files],
+        "files_to_restart_on_change": [f.short_path for f in files_to_restart_on_change],
     }
 
     runfiles_merge_targets = ctx.attr.data[:]
@@ -81,7 +90,7 @@ def _impl(ctx):
     ctx.actions.write(config_file, json.encode(config))
 
     runfiles = ctx.runfiles(
-        files = ctx.files.data + [config_file],
+        files = ctx.files.data + [config_file] + files_to_restart_on_change,
         transitive_files = depset(transitive = transitive_runfiles),
     ).merge(launcher.runfiles).merge_all([
         target[DefaultInfo].default_runfiles
@@ -109,6 +118,7 @@ def js_run_devserver(
         grant_sandbox_write_permissions = False,
         use_execroot_entry_point = True,
         allow_execroot_entry_point_with_no_copy_data_to_bin = False,
+        packages_to_restart_on_change = [],
         **kwargs):
     """Runs a devserver via binary target or command.
 
@@ -228,6 +238,12 @@ def js_run_devserver(
 
             See `use_execroot_entry_point` doc for more info.
 
+        packages_to_restart_on_change: List of npm packages to force restart devserver on changes.
+
+            Glob patterns `**`, `*` and `?` are supported. See `glob_match` documentation for
+            more details on how to use glob patterns:
+            https://github.com/aspect-build/bazel-lib/blob/main/docs/glob_match.md.
+
         **kwargs: All other args from `js_binary` except for `entry_point` which is set implicitly.
 
             `entry_point` is set implicitly by `js_run_devserver` and cannot be overridden.
@@ -252,5 +268,6 @@ def js_run_devserver(
         grant_sandbox_write_permissions = grant_sandbox_write_permissions,
         use_execroot_entry_point = use_execroot_entry_point,
         allow_execroot_entry_point_with_no_copy_data_to_bin = allow_execroot_entry_point_with_no_copy_data_to_bin,
+        packages_to_restart_on_change = packages_to_restart_on_change,
         **kwargs
     )

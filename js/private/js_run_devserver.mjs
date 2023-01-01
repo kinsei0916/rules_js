@@ -33,78 +33,99 @@ function mkdirpSync(p) {
     mkdirs.add(p)
 }
 
+async function walk(root, callback) {
+    async function walkInternal(current) {
+        const absolutePath = path.join(root, current)
+        try {
+            const lstat = await fs.promises.lstat(absolutePath)
+            if (lstat.isSymbolicLink()) {
+                await callback?.(current, lstat)
+            } else if (lstat.isDirectory()) {
+                await callback?.(current, lstat)
+                const contents = await fs.promises.readdir(absolutePath)
+                await Promise.all(
+                    contents.map((entry) =>
+                        walkInternal(path.join(current, entry))
+                    )
+                )
+            } else {
+                await callback?.(current, lstat)
+            }
+        } catch (e) {
+            console.error(e)
+            process.exit(1)
+        }
+    }
+    await walkInternal('')
+}
+
+async function walkModifiedItems(root, callback) {
+    let modified = 0
+    await walk(root, async (entry, lstat) => {
+        const currentPath = path.join(root, entry)
+        const last = synced.get(currentPath)
+        if (!lstat.isDirectory() && last && lstat.mtimeMs == last) {
+            // this file is already up-to-date
+            return
+        }
+        synced.set(currentPath, lstat.mtimeMs)
+        await callback?.(entry, lstat)
+        if (lstat.isSymbolicLink() || !lstat.isDirectory()) {
+            modified++
+        }
+    })
+    return modified
+}
+
 // Recursively copies a file, symlink or directory to a destination. If the file has been previously
 // synced it is only re-copied if the file's last modified time has changed since the last time that
 // file was copied. Symlinks are not copied but instead a symlink is created under the destination
 // pointing to the source symlink.
 async function syncRecursive(src, dst, writePerm) {
-    try {
-        const lstat = await fs.promises.lstat(src)
-        const last = synced.get(src)
-        if (!lstat.isDirectory() && last && lstat.mtimeMs == last) {
-            // this file is already up-to-date
-            return 0
-        }
-        const exists = synced.has(src) || fs.existsSync(dst)
-        synced.set(src, lstat.mtimeMs)
+    return walkModifiedItems(src, async (entry, lstat) => {
+        const srcPath = path.join(src, entry)
+        const dstPath = path.join(dst, entry)
+        const exists = fs.existsSync(dstPath)
         if (lstat.isSymbolicLink()) {
             if (process.env.JS_BINARY__LOG_DEBUG) {
                 console.error(
-                    `Syncing symlink ${src.slice(RUNFILES_ROOT.length + 1)}`
+                    `Syncing symlink ${srcPath.slice(RUNFILES_ROOT.length + 1)}`
                 )
             }
             if (exists) {
-                await fs.promises.unlink(dst)
+                await fs.promises.unlink(dstPath)
             } else {
-                mkdirpSync(path.dirname(dst))
+                mkdirpSync(path.dirname(dstPath))
             }
-            await fs.promises.symlink(src, dst)
-            return 1
+            await fs.promises.symlink(srcPath, dstPath)
         } else if (lstat.isDirectory()) {
-            const contents = await fs.promises.readdir(src)
             if (!exists) {
-                mkdirpSync(dst)
+                mkdirpSync(dstPath)
             }
-            return (
-                await Promise.all(
-                    contents.map(
-                        async (entry) =>
-                            await syncRecursive(
-                                path.join(src, entry),
-                                path.join(dst, entry),
-                                writePerm
-                            )
-                    )
-                )
-            ).reduce((s, t) => s + t, 0)
         } else {
             if (process.env.JS_BINARY__LOG_DEBUG) {
                 console.error(
-                    `Syncing file ${src.slice(RUNFILES_ROOT.length + 1)}`
+                    `Syncing file ${srcPath.slice(RUNFILES_ROOT.length + 1)}`
                 )
             }
             if (exists) {
-                await fs.promises.unlink(dst)
+                await fs.promises.unlink(dstPath)
             } else {
-                mkdirpSync(path.dirname(dst))
+                mkdirpSync(path.dirname(dstPath))
             }
-            await fs.promises.copyFile(src, dst)
+            await fs.promises.copyFile(srcPath, dstPath)
             if (writePerm) {
-                const s = await fs.promises.stat(dst)
+                const s = await fs.promises.stat(dstPath)
                 const mode = s.mode | fs.constants.S_IWUSR
                 console.error(
                     `Adding write permissions to file ${src.slice(
                         RUNFILES_ROOT.length + 1
                     )}: ${(mode & parseInt('777', 8)).toString(8)}`
                 )
-                await fs.promises.chmod(dst, mode)
+                await fs.promises.chmod(dstPath, mode)
             }
-            return 1
         }
-    } catch (e) {
-        console.error(e)
-        process.exit(1)
-    }
+    })
 }
 
 // Sync list of files to the sandbox
@@ -128,6 +149,57 @@ async function sync(files, sandbox, writePerm) {
     )
 }
 
+async function checkIfModified(files) {
+    const totalModified = (
+        await Promise.all(
+            files.map(async (file) => {
+                const root = path.join(RUNFILES_ROOT, file)
+                return await walkModifiedItems(root)
+            })
+        )
+    ).reduce((s, t) => s + t, 0)
+    return totalModified > 0
+}
+
+class ProcessRunner {
+    constructor(command, args, options) {
+        this._command = command
+        this._args = args
+        this._options = options
+        this._process = null
+        this._handleClose = this._handleClose.bind(this)
+
+        this.onerror = null
+
+        this._run()
+    }
+
+    restart() {
+        this._process?.off('close', this._handleClose)
+        this._kill()
+        this._run()
+    }
+
+    _handleClose(code) {
+        this?.onerror(code)
+    }
+
+    _run() {
+        if (this._process) return
+        this._process = child_process.spawn(
+            this._command,
+            this._args,
+            this._options
+        )
+        this._process.on('close', this._handleClose)
+    }
+
+    _kill() {
+        this._process?.kill()
+        this._process = null
+    }
+}
+
 async function main(args, sandbox) {
     console.error(
         `\n\nStarting js_run_devserver ${process.env.JS_BINARY__TARGET}`
@@ -137,6 +209,7 @@ async function main(args, sandbox) {
 
     const config = JSON.parse(await fs.promises.readFile(configPath))
 
+    await checkIfModified(config.files_to_restart_on_change)
     await sync(
         config.data_files,
         sandbox,
@@ -178,17 +251,17 @@ async function main(args, sandbox) {
             }
         }
 
-        const proc = child_process.spawn(tool, toolArgs, {
+        const proc = new ProcessRunner(tool, toolArgs, {
             cwd: cwd,
             stdio: 'inherit',
             env: env,
         })
 
-        proc.on('close', (code) => {
+        proc.onerror = (code) => {
             console.error(`child tool process exited with code ${code}`)
             resolve()
             process.exit(code)
-        })
+        }
 
         let syncing = Promise.resolve()
         process.stdin.on('data', async (chunk) => {
@@ -199,14 +272,25 @@ async function main(args, sandbox) {
                         console.error('IBAZEL_BUILD_COMPLETED SUCCESS')
                     }
                     // Chain promises via syncing.then()
-                    syncing = syncing.then(() =>
-                        sync(
-                            // Re-parse the config file to get the latest list of data files to copy
-                            JSON.parse(fs.readFileSync(configPath)).data_files,
-                            sandbox,
-                            config.grant_sandbox_write_permissions
+                    syncing = syncing
+                        .then(() =>
+                            checkIfModified(config.files_to_restart_on_change)
                         )
-                    )
+                        .then((modified) => {
+                            if (modified) {
+                                console.error('Restarting...')
+                                proc.restart()
+                            }
+                        })
+                        .then(() =>
+                            sync(
+                                // Re-parse the config file to get the latest list of data files to copy
+                                JSON.parse(fs.readFileSync(configPath))
+                                    .data_files,
+                                sandbox,
+                                config.grant_sandbox_write_permissions
+                            )
+                        )
                     // Await promise to catch any exceptions
                     await syncing
                 } else if (chunkString.includes('IBAZEL_BUILD_STARTED')) {
